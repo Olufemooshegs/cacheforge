@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "prometheus-client>=0.20",
+    "alembic>=1.13",
 ]
 
 [project.optional-dependencies]

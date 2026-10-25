@@ -61,7 +61,13 @@ CacheForge (src/cacheforge/)
 
 ## Quick start
 
-Requires Docker + Python 3.12+.
+docker compose up -d                # Redis on 6380, Postgres on 5433
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+
+alembic upgrade head                # schema is managed by Alembic
+python -m demo.seed                 # 1000 deterministic products
+python -m uvicorn demo.api:app --port 8000
 
 ```bash
 git clone https://github.com/<you>/cacheforge

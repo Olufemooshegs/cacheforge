@@ -7,21 +7,23 @@ from sqlalchemy import delete
 
 from .config import DemoSettings
 from .db import make_engine, make_sessionmaker
-from .models import Base, Product
+from .models import Product
 
 CATEGORIES = ("books", "electronics", "home", "sports", "toys")
 
 
 async def seed(n: int = 1000) -> None:
+    """Seed the database with deterministic products.
+
+    Schema is managed by Alembic — run `alembic upgrade head` first.
+    """
     settings = DemoSettings()
     engine = make_engine(settings.database_url)
     try:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
         sessionmaker = make_sessionmaker(engine)
         async with sessionmaker() as session:
             await session.execute(delete(Product))
-            rng = random.Random(42)  # deterministic
+            rng = random.Random(42)
             session.add_all(
                 Product(
                     name=f"Product {i}",
