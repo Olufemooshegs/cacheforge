@@ -6,7 +6,7 @@ A production-oriented, Redis-backed distributed caching layer for Python. CacheF
 
 **PostgreSQL is the source of truth. Redis is a performance layer.**
 
-## 📊 Results (Real Benchmarks)
+##  Results (Real Benchmarks)
 
 Using `k6` to simulate 50 concurrent users for 30 seconds, CacheForge demonstrates its impact under sustained load:
 
@@ -23,7 +23,7 @@ Using `k6` to simulate 50 concurrent users for 30 seconds, CacheForge demonstrat
 
 ---
 
-## ✨ Features
+## Features
 
 - **Cache-Aside Reads**: Deterministic keys, namespacing, versioning, and configurable TTL with jitter.
 - **Single-Flight Coalescing**: Protects the database from stampedes during cold starts.
@@ -35,7 +35,7 @@ Using `k6` to simulate 50 concurrent users for 30 seconds, CacheForge demonstrat
 
 ---
 
-## 🏗️ Architecture
+##  Architecture
 
 ```mermaid
 graph TD
@@ -67,7 +67,7 @@ graph TD
 
 ---
 
-## 🚀 Quick Start
+##  Quick Start
 
 Requires Docker and Python 3.12+.
 
@@ -122,7 +122,7 @@ open http://localhost:9090
 
 ---
 
-## 🧠 Design Decisions & Trade-offs
+##  Design Decisions & Trade-offs
 
 - **Eventual Consistency over Strong Consistency**: We use a transactional outbox and best-effort invalidation. There is a sub-second window where stale data can be served after a write. See [CONSISTENCY.md](CONSISTENCY.md) for the exact guarantees.
 - **No Distributed Locks by Default**: Benchmarks proved per-process single-flight is sufficient. A distributed lock adds latency without meaningful DB savings. See [benchmarks/README.md](benchmarks/README.md).
@@ -130,5 +130,5 @@ open http://localhost:9090
 
 ---
 
-## 📝 License
+## License
 MIT
