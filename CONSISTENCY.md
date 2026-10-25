@@ -122,3 +122,69 @@ miss-driven negative lookups dominate.
   writes must go through the service for cache to stay consistent.
   Enforced by convention, not by schema. A future phase could enforce
   this via `LISTEN/NOTIFY` or a DB trigger that inserts outbox events.
+
+  ## Stale-serving policy (Phase 5)
+
+Spec §8.2 asks: when PostgreSQL is unavailable but Redis holds a value,
+may cached reads still serve? Possible policies:
+
+| Policy | Behavior | CacheForge |
+|---|---|---|
+| Serve valid cached values for read-only | Hits OK, misses fail | **Chosen** |
+| Serve stale values for approved data types | Allowlist required | Not implemented |
+| Reject authoritative reads | All fails | Not chosen |
+| Never claim freshness without DB confirmation | Always fail on DB down | Not chosen |
+
+### Our policy
+
+**Cache hits are served during a Postgres outage. Cache misses fail with
+HTTP 500.**
+
+Rationale:
+
+1. The value was already served to a user before the outage started.
+   Serving it again within its TTL is no less fresh than serving it
+   would have been without the outage.
+2. Cache misses **cannot** be served because we have no source of truth.
+   We do not synthesize data, and we do not serve a "best guess."
+3. Writes always require PostgreSQL, so they fail cleanly during an
+   outage. There is no "accepted but not applied" state.
+
+### What this means operationally
+
+| Request | Postgres OK | Postgres slow | Postgres down |
+|---|---|---|---|
+| Cache hit | Served | Served (fast) | **Served (fast)** |
+| Cache miss | DB load, served | DB load, slow | **HTTP 500** |
+| Write (PATCH/DELETE) | Committed | Slow commit | **HTTP 500** |
+| `/health/ready` | 200 | 200 | **503** |
+
+### What we do NOT do
+
+- **No stale-while-revalidate.** There is no background refresh on
+  read; there is no "stale" window that serves past TTL. Every read
+  either hits within TTL or loads from Postgres.
+- **No negative caching.** Missing rows hit Postgres every time; during
+  a DB outage, missing-ID lookups fail 500 with no fallback.
+- **No "assume Redis is authoritative" mode.** Redis never overrides
+  Postgres; if the two disagree, Postgres wins on the next miss.
+
+### TTL bounds the exposure
+
+If Postgres dies while a key is cached:
+
+- Reads serve the cached value for up to `CACHEFORGE_CACHE_DEFAULT_TTL_SECONDS`
+  (300s default), then fail.
+- After TTL expires, `/health/ready` is 503 and cache misses fail 500.
+
+This means the outward-visible behavior under DB outage is: **degraded,
+not silently wrong**. Users see stale reads (bounded by TTL) and then
+clean errors, never "new-looking data that is actually stale."
+
+### Writes and staleness
+
+Writes during a Postgres outage fail at the commit step. Nothing is
+written. There is no queued-write-that-replays-later mode (that would
+be eventual consistency of writes, out of scope for v0.1). Phase 6
+transactional outbox is about *invalidation delivery*, not about
+buffering writes.

@@ -48,7 +48,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.redis = redis
     app.state.breaker = breaker
     app.state.cache = cache
-    app.state.service = ProductService(sessionmaker, cache)
+    app.state.service = ProductService(
+        sessionmaker,
+        cache,
+        query_delay_seconds=settings.query_delay_seconds,
+    )
     try:
         yield
     finally:

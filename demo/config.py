@@ -14,3 +14,8 @@ class DemoSettings(BaseSettings):
     circuit_failure_threshold: int = 5
     circuit_window_size: int = 20
     circuit_recovery_timeout_seconds: float = 5.0
+
+    # Test-only: inject artificial latency into DB loads. 0.0 disables.
+    # Used by benchmarks/phase5c_postgres_resilience.py to simulate a slow
+    # database without external tooling.
+    query_delay_seconds: float = 0.0
