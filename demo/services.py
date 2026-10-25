@@ -5,7 +5,9 @@ import contextlib
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cacheforge.client import Cache
+from cacheforge.coordination.singleflight import SingleFlight
 from cacheforge.exceptions import CacheUnavailable
+from cacheforge.observability import metrics
 
 from .repositories import ProductRepository
 from .schemas import ProductRead
@@ -18,9 +20,14 @@ class ProductService:
         self,
         sessionmaker: async_sessionmaker[AsyncSession],
         cache: Cache,
+        fallback_single_flight: SingleFlight | None = None,
     ) -> None:
         self._sessionmaker = sessionmaker
         self._cache = cache
+        # Separate registry from the Cache's internal single-flight. A
+        # Redis-timeout burst and a normal-miss burst are different failure
+        # modes and should not contend for the same in-flight registry.
+        self._fallback_sf = fallback_single_flight or SingleFlight()
 
     def _detail_key(self, product_id: int) -> str:
         return self._cache.key(DETAIL, product_id)
@@ -30,8 +37,17 @@ class ProductService:
         try:
             payload = await self._cache.get_or_load(key, lambda: self._load_detail(product_id))
         except CacheUnavailable:
-            # Phase 5 will add a circuit breaker and a bounded DB pool here.
-            payload = await self._load_detail(product_id)
+            # Redis is unreachable or timed out. Coalesce the fallback so a
+            # burst of N failing cache reads does not become N DB queries.
+            # Spec §8.1: "Fail-open does not mean unlimited database traffic."
+            # Phase 5 will still add a circuit breaker and bounded DB
+            # concurrency; this is the minimum needed to keep the fallback
+            # from amplifying a cache outage into a database outage.
+            metrics.CACHE_FALLBACK.labels("redis_unavailable").inc()
+            payload = await self._fallback_sf.do(
+                f"fallback:{key}",
+                lambda: self._load_detail(product_id),
+            )
         if payload is None:
             return None
         return ProductRead.model_validate(payload)
