@@ -1,20 +1,24 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from prometheus_client import make_asgi_app
 from redis.asyncio import Redis
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 
 from cacheforge.client import Cache
 from cacheforge.config import CacheConfig
 from cacheforge.coordination.singleflight import SingleFlight
+from cacheforge.outbox import OutboxWorker
 from cacheforge.resilience import CircuitBreaker
 
 from .config import DemoSettings
 from .db import make_engine, make_sessionmaker
+from .models import OutboxEvent
 from .schemas import ProductRead, ProductUpdate
 from .services import ProductService
 
@@ -43,6 +47,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         single_flight=SingleFlight(),
         circuit_breaker=breaker,
     )
+    worker = OutboxWorker(
+        sessionmaker=sessionmaker,
+        cache=cache,
+        poll_interval=settings.outbox_poll_interval_seconds,
+    )
+    worker_task = asyncio.create_task(worker.run_forever())
+
     app.state.engine = engine
     app.state.sessionmaker = sessionmaker
     app.state.redis = redis
@@ -53,9 +64,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cache,
         query_delay_seconds=settings.query_delay_seconds,
     )
+    app.state.worker = worker
+    app.state.worker_task = worker_task
     try:
         yield
     finally:
+        worker.stop()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
         await redis.aclose()
         await engine.dispose()
 
@@ -135,3 +152,17 @@ async def warm_cache(
 @app.get("/admin/cache/circuit-state")
 async def circuit_state(request: Request) -> dict[str, str]:
     return {"state": request.app.state.breaker.state.value}
+
+
+@app.get("/admin/outbox/stats")
+async def outbox_stats(request: Request) -> dict:
+    async with request.app.state.sessionmaker() as session:
+        pending = await session.scalar(
+            select(func.count()).select_from(OutboxEvent).where(OutboxEvent.processed_at.is_(None))
+        )
+        processed = await session.scalar(
+            select(func.count())
+            .select_from(OutboxEvent)
+            .where(OutboxEvent.processed_at.is_not(None))
+        )
+    return {"pending": int(pending or 0), "processed": int(processed or 0)}

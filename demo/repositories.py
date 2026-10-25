@@ -19,8 +19,9 @@ class ProductRepository:
         for key, value in fields.items():
             if value is not None:
                 setattr(product, key, value)
-        await self._session.commit()
-        await self._session.refresh(product)
+        # Caller controls the transaction (see ProductService.update_detail)
+        # so the update and the outbox insert commit atomically.
+        await self._session.flush()
         return product
 
     async def delete(self, product_id: int) -> bool:
@@ -28,5 +29,5 @@ class ProductRepository:
         if product is None:
             return False
         await self._session.delete(product)
-        await self._session.commit()
+        await self._session.flush()
         return True

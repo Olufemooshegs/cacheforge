@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import contextlib
+import json
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cacheforge.client import Cache
@@ -12,11 +12,12 @@ from cacheforge.exceptions import CacheUnavailable
 from cacheforge.observability import metrics
 from cacheforge.warming import warm_keys
 
-from .models import Product
+from .models import OutboxEvent, Product
 from .repositories import ProductRepository
 from .schemas import ProductRead
 
 DETAIL = "product"
+INVALIDATE_TOPIC = "product.invalidate"
 
 
 class ProductService:
@@ -36,6 +37,8 @@ class ProductService:
     def _detail_key(self, product_id: int) -> str:
         return self._cache.key(DETAIL, product_id)
 
+    # ------------------------------------------------------------------ read
+
     async def get_detail(self, product_id: int) -> ProductRead | None:
         key = self._detail_key(product_id)
         try:
@@ -52,6 +55,8 @@ class ProductService:
 
     async def _load_detail(self, product_id: int) -> dict | None:
         if self._query_delay_seconds > 0:
+            import asyncio
+
             await asyncio.sleep(self._query_delay_seconds)
         async with self._sessionmaker() as session:
             row = await ProductRepository(session).get(product_id)
@@ -59,24 +64,87 @@ class ProductService:
                 return None
             return ProductRead.model_validate(row).model_dump(mode="json")
 
+    # ----------------------------------------------------------------- write
+
     async def update_detail(self, product_id: int, fields: dict) -> ProductRead | None:
-        async with self._sessionmaker() as session:
+        key = self._detail_key(product_id)
+        outbox_id: int | None = None
+        updated_payload: dict | None = None
+
+        # Phase 1: business update + outbox event in ONE transaction.
+        async with self._sessionmaker() as session, session.begin():
             updated = await ProductRepository(session).update(product_id, fields)
-        if updated is None:
-            return None
-        await self.invalidate_detail(product_id)
-        return ProductRead.model_validate(updated)
+            if updated is None:
+                return None
+            outbox = OutboxEvent(
+                topic=INVALIDATE_TOPIC,
+                payload=json.dumps({"key": key}),
+            )
+            session.add(outbox)
+            await session.flush()
+            outbox_id = outbox.id
+
+            # The DB generated a new updated_at via onupdate=func.now(),
+            # marking the attribute expired. Refresh inside the async
+            # transaction so Pydantic can read it synchronously later.
+            await session.refresh(updated)
+
+            updated_payload = ProductRead.model_validate(updated).model_dump(mode="json")
+
+        # Transaction committed here. Both the row and the event are durable.
+
+        # Phase 2: best-effort direct invalidation (fast path).
+        await self._try_direct_invalidate(key, outbox_id)
+        return ProductRead.model_validate(updated_payload)
 
     async def delete_detail(self, product_id: int) -> bool:
-        async with self._sessionmaker() as session:
+        key = self._detail_key(product_id)
+        outbox_id: int | None = None
+
+        async with self._sessionmaker() as session, session.begin():
             deleted = await ProductRepository(session).delete(product_id)
-        if deleted:
-            await self.invalidate_detail(product_id)
-        return deleted
+            if not deleted:
+                return False
+            outbox = OutboxEvent(
+                topic=INVALIDATE_TOPIC,
+                payload=json.dumps({"key": key}),
+            )
+            session.add(outbox)
+            await session.flush()
+            outbox_id = outbox.id
+
+        await self._try_direct_invalidate(key, outbox_id)
+        return True
+
+    async def _try_direct_invalidate(self, key: str, outbox_id: int | None) -> None:
+        """Best-effort fast-path delete; on success, mark the outbox event
+        processed so the worker doesn't touch it.
+
+        On `CacheUnavailable`, leave the outbox event for the worker to
+        retry. This is the exact scenario the outbox exists to handle.
+        """
+        try:
+            await self._cache.delete(key)
+        except CacheUnavailable:
+            metrics.CACHE_INVALIDATIONS.labels("deferred", "direct").inc()
+            return
+        metrics.CACHE_INVALIDATIONS.labels("ok", "direct").inc()
+        if outbox_id is not None:
+            async with self._sessionmaker() as session, session.begin():
+                await session.execute(
+                    update(OutboxEvent)
+                    .where(OutboxEvent.id == outbox_id)
+                    .where(OutboxEvent.processed_at.is_(None))
+                    .values(processed_at=_now())
+                )
 
     async def invalidate_detail(self, product_id: int) -> None:
+        """Admin-triggered direct invalidation. No outbox event."""
+        key = self._detail_key(product_id)
         with contextlib.suppress(CacheUnavailable):
-            await self._cache.delete(self._detail_key(product_id))
+            await self._cache.delete(key)
+
+    # ---------------------------------------------------------------- warm
 
     async def warm_products(
         self,
@@ -110,3 +178,10 @@ class ProductService:
             "duration_seconds": round(warming.duration_seconds, 3),
             "success_rate": round(warming.success_rate, 4),
         }
+
+
+def _now():
+    """Return a SQL expression for the current timestamp (DB-side now())."""
+    from sqlalchemy import func
+
+    return func.now()

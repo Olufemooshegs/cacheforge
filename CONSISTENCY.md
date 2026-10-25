@@ -188,3 +188,62 @@ written. There is no queued-write-that-replays-later mode (that would
 be eventual consistency of writes, out of scope for v0.1). Phase 6
 transactional outbox is about *invalidation delivery*, not about
 buffering writes.
+
+## Window 1 — now closed (Phase 6b)
+
+Before Phase 6b, an update that committed to PostgreSQL but then failed
+to invalidate Redis left the cache serving the pre-write value until TTL
+(up to `CACHEFORGE_CACHE_DEFAULT_TTL_SECONDS`, default 300s).
+
+Phase 6b closes this with a transactional outbox:
+
+### Write path (Phase 6b)
+
+1. `UPDATE products SET ...` — business change.
+2. `INSERT INTO outbox_events(topic, payload)` — invalidation intent.
+3. **COMMIT** — both rows land atomically.
+4. Best-effort `DEL cacheforge:v1:product:<id>`.
+5. If (4) succeeds, mark the outbox row `processed_at = now()`.
+6. If (4) fails (`CacheUnavailable` or breaker OPEN), leave the row
+   unprocessed. A background worker delivers it on the next poll cycle.
+
+### What this changes
+
+| Scenario | Before 6b | After 6b |
+|---|---|---|
+| Redis up | Invalidate in request path | Invalidate in request path (same) |
+| Redis briefly down | Stale until TTL | Stale until worker delivers (typically <200ms) |
+| Redis down for hours | Stale until TTL | Stale until TTL, but only if Redis is down for the full TTL |
+| App crashes after commit | Stale until TTL | Outbox row survives; new worker picks it up on next start |
+
+### What this does not change
+
+- **Read-your-own-writes** is still not guaranteed across connections.
+  The direct invalidation is best-effort and async relative to the
+  client's `PATCH` response.
+- **Window 2** (stale read races) is unaffected. A slow reader can
+  still repopulate the cache with a pre-write value; only the write
+  path got durability, not the read path.
+- **Writes never buffer.** A `PATCH` during a Postgres outage still
+  fails cleanly. The outbox is about *invalidation delivery*, not about
+  making writes durable against DB outage.
+
+### Guarantees
+
+- **Durability**: once `PATCH` returns 200, the invalidation intent is
+  committed and will eventually be delivered, even if the app crashes
+  between the commit and the Redis call.
+- **Bounded delay**: on the happy path, sub-millisecond (direct call).
+  On `CacheUnavailable`, bounded by the worker poll interval (default
+  100ms) + Redis recovery time.
+- **Idempotent**: `DEL` is idempotent; reprocessing after a crash is a
+  no-op. Malformed payloads are marked processed rather than retried
+  forever.
+
+### Tests
+
+- `tests/integration/test_outbox.py` — 6 tests: event written with
+  update, deferred when Redis down, worker delivers deferred event,
+  idempotent on reprocess, handles malformed payload.
+- `tests/failure_injection/test_outbox_window_closure.py` — the
+  load-bearing test that closes Window 1 end-to-end.
