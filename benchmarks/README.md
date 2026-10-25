@@ -412,3 +412,34 @@ Interestingly, the Zipfian "cold" workload quickly becomes self-warming; its thr
 ### Reproducibility
 
 Run `./benchmarks/k6/run.sh <mode>` for any mode. Ensure the API is running on `:8000` and k6 is installed. The baseline requires restarting uvicorn with `CACHEFORGE_CACHE_BYPASS=true`.
+
+## Phase 7b — Observability (Prometheus + Grafana)
+
+### What we measure
+Full operational visibility into the cache, database, and circuit breaker. The stack runs via Docker Compose:
+- `prometheus` scrapes `http://host.docker.internal:8000/metrics` every 5 seconds.
+- `grafana` visualizes the metrics via a provisioned "CacheForge Overview" dashboard.
+
+### Dashboard Panels
+1. **Cache Hit Ratio** — Gauge showing `hits / (hits + misses)`.
+2. **Cache Request Rate** — Hits vs Misses per second over time.
+3. **Redis Operation Latency** — p50/p95 histograms of Redis calls.
+4. **Database Load & Outbox** — DB queries per second and pending outbox events.
+
+### The WSL2 Networking Quirk
+During Phase 7b, we changed uvicorn from `--host 127.0.0.1` to `--host 0.0.0.0` so the Prometheus container could reach it via `host.docker.internal`. 
+
+When running k6 against `0.0.0.0` on WSL2, throughput dropped from **~800 req/s to ~334 req/s** (and latency rose from 62ms to 148ms). The database load stayed at 0 and the cache hit ratio stayed at 100%. 
+
+**Conclusion:** The bottleneck is WSL2's virtual network switch handling `0.0.0.0` traffic, not CacheForge. In a native Linux environment, `0.0.0.0` does not incur this penalty. This is documented to explain why the k6 numbers in 7a are higher than the numbers recorded during the live Grafana test.
+
+### How to run
+```bash
+docker compose up -d
+# Ensure uvicorn is running with --host 0.0.0.0
+.venv/bin/python -m uvicorn demo.api:app --host 0.0.0.0 --port 8000
+
+# View Grafana
+open http://localhost:3000
+# View Prometheus
+open http://localhost:9090
