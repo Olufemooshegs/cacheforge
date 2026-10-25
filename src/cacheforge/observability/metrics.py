@@ -31,3 +31,15 @@ CACHE_INVALIDATIONS = Counter(
     "Invalidation outcomes",
     ["result"],
 )
+
+CACHE_WARMING_TOTAL = Counter(
+    "cache_warming_total",
+    "Cache warming outcomes by result",
+    ["result"],
+)
+
+CACHE_WARMING_DURATION = Histogram(
+    "cache_warming_duration_seconds",
+    "Duration of a full cache warming run",
+    buckets=(0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0),
+)

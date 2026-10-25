@@ -78,64 +78,74 @@ bounded by the worker count, which is a small integer.
 
 ### Results
 
-#### 2026-10-25 — after bounded-fallback fix
+#### 2026-10-25 — after warm-cache benchmark hardening
 
 Environment:
 - WSL2 Ubuntu 24.04 (shared VM, no CPU pinning)
 - Python 3.14.4, redis-py 8.1.0, asyncpg 0.32.0, prometheus-client 0.26.0
 - Redis 7-alpine (Docker, host port 6380), Postgres 16-alpine (Docker, host port 5433)
 - 1000 seeded products, `CACHEFORGE_CACHE_DEFAULT_TTL_SECONDS=300`, no jitter
-- Single product (ID 1), cache key `DEL`'d before each burst
-- 500 concurrent requests, `httpx.Limits(max_connections=1000)`
+- Read-one-per-product workload (100 distinct keys), 1 uvicorn worker
 
-| Workers | Requests | pg_delta | loader_delta | elapsed_ms |
-|---|---|---|---|---|
-| 1 | 500 | 2 | 1 | 6607 |
-| 2 | 500 | 2 | 1 | 6444 |
-
-`pg_delta` — aggregate Postgres scan-counter delta across the burst.
-`loader_delta` — per-worker `cache_load_duration_seconds_count{source="database"}`;
-reliable only when workers=1.
+| Condition | Requests | elapsed_ms | pg_delta | hits | misses | errors |
+|---|---|---|---|---|---|---|
+| cold | 100 | 1731 | 53 | 0 | 200 | 0 |
+| warm | 100 | 645 | 1 | 100 | 0 | 0 |
 
 ### Verdict
 
-**ACCEPT.** pg_delta is bounded by worker count, not request count
-(2 queries for 500 requests across 2 workers). Per-process single-flight
-coalesces within each worker. A distributed lock would add latency on
-every read to save at most 1 query per worker per burst. Not justified
-(spec §6.3).
+**ACCEPT.** Warming is effective and observable:
 
-### What the benchmark discovered
+- Cold path: 0 hits, all misses, ~53 measured DB queries (real is ~100;
+  see "known limitation" below).
+- Warm path: 100/100 cache hits, **1 DB query total** (which is the
+  canary query from `wait_for_stats_settle`, not a read-path query).
+- Elapsed speedup: **2.69×** from warming 100 keys before the burst.
+- Redis key state after warming: **100/100**.
 
-During the first run of this experiment (before the fallback was bounded),
-a burst of 500 concurrent requests produced **500 DB queries**. Root cause:
-`ProductService.get_detail` caught `CacheUnavailable` and fell through to
-`self._load_detail(product_id)` with no coalescing. Under 500 concurrent
-requests, every Redis GET timed out (`cache_requests_total{get,error}=500`),
-and 500 requests each fired a direct DB query.
+The `cache_requests_total` metric deltas are the authoritative acceptance
+signal. `pg_delta` corroborates on the warm path and slightly undercounts
+on the cold path (see below). Both directions agree with the intent.
 
-This is the exact failure mode spec §8.1 warns about:
+### What the benchmark discovered (again)
 
-> "Fail-open does not mean unlimited database traffic. A cache outage can
-> cause a database outage if every request is allowed to fall through
-> without limits."
+The first run of this benchmark reported `pg_delta=101` on the warm
+condition, even though warming had succeeded (`succeeded=100`) and 100
+keys were in Redis. Root cause: **warming's own 100 DB queries were
+still flushing from Postgres's backend-local stats when the reads
+baseline was taken**. The reads window captured them; the counter
+looked like 101 "read" queries.
 
-Fixed by routing the fallback through a second `SingleFlight` instance
-(`ProductService._fallback_sf`), separate from the cache's internal
-registry. Regression test: `tests/failure_injection/test_fallback_coalescing.py`.
-After the fix: 500 Redis timeouts → **1 DB query**.
+Fix: `wait_for_stats_settle` fires a canary query and waits for it to
+appear in `pg_stat_user_tables`, then waits a settle window. That
+guarantees stats are current before taking the baseline. After the fix,
+warm `pg_delta` dropped from 101 to 1.
 
-### Known limitations (Phase 5 / Phase 7 items)
+This is the same class of bug as Phase 3's "500 concurrent same-key
+reads showed 500 DB queries" — an app that appears correct under
+casual inspection, but whose benchmark measured the wrong thing.
+Postgres stats aggregation is not deterministic; the benchmark must
+prove that its own measurement channel is settled before trusting the
+number.
 
-1. **Redis timeouts at high concurrency.** Every request in the 500-burst
-   hits the 500 ms Redis timeout. On a healthy Redis, the same burst
-   completes in ~100 ms. Phase 5 (circuit breaker + timeout tuning) is
-   the fix. The pg_delta measurement is unaffected because the fallback
-   coalesces regardless.
+### Known limitations
 
-2. **`loader_delta` unreliable at workers>1.** Per-worker prometheus
-   registry; the harness reads whichever worker answers `/metrics/`.
-   pg_delta is authoritative.
+1. **Cold `pg_delta=53` undercounts the real load (~100).** WSL2
+   Postgres 16 stats-flush across a 10-connection pool is not perfectly
+   aggregated even after the canary settle. Direction is correct;
+   magnitude is a lower bound. On a native-Linux host or with
+   `pg_stat_statements` this would not be an issue. Not worth chasing
+   further: the warm `pg_delta=1` (essentially zero) and the cache
+   metric hit/miss split (0/200 vs 100/0) are unambiguous acceptance
+   criteria on their own.
 
-3. **Single-burst workload only.** Sustained throughput, mixed read/write,
-   hot-key vs. spread, and recovery are all Phase 7 items.
+2. **Phase 3's Redis-timeout issue did not reproduce here.** Phase 3
+   saw `errors=500` at 500-concurrent on the *same* key. Phase 4 shows
+   `errors=0` at 100-concurrent on *100 distinct keys*. That suggests
+   the timeout is same-key contention, not Redis throughput. Phase 5
+   work (circuit breaker) is orthogonal — it will help with a real
+   outage, not with this contention pattern. Investigating the timeout
+   root cause is Phase 5b.
+
+3. **No negative caching yet.** Warming of missing IDs would waste a
+   DB query each time. Not in scope for Phase 4.

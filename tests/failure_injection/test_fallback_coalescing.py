@@ -45,9 +45,7 @@ async def test_redis_error_burst_coalesces_to_one_db_load(
     monkeypatch.setattr(ProductRepository, "get", counting_get)
 
     service = ProductService(pg_sessionmaker, cache)
-    results = await asyncio.gather(
-        *(service.get_detail(a_id) for _ in range(500))
-    )
+    results = await asyncio.gather(*(service.get_detail(a_id) for _ in range(500)))
 
     assert all(r is not None and r.id == a_id for r in results)
     assert calls["n"] == 1, (

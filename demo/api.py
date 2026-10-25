@@ -99,3 +99,21 @@ async def delete_product(product_id: int, request: Request) -> dict[str, bool]:
 async def invalidate(product_id: int, request: Request) -> dict[str, int]:
     await request.app.state.service.invalidate_detail(product_id)
     return {"invalidated": product_id}
+
+
+@app.post("/admin/cache/warm")
+async def warm_cache(
+    request: Request,
+    limit: int = 100,
+    concurrency: int = 10,
+    batch_size: int = 50,
+) -> dict:
+    if limit < 1 or limit > 1000:
+        raise HTTPException(400, "limit must be in [1, 1000]")
+    if concurrency < 1 or concurrency > 100:
+        raise HTTPException(400, "concurrency must be in [1, 100]")
+    if batch_size < 1 or batch_size > 500:
+        raise HTTPException(400, "batch_size must be in [1, 500]")
+    return await request.app.state.service.warm_products(
+        limit=limit, concurrency=concurrency, batch_size=batch_size
+    )

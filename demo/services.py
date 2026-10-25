@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 
+from cacheforge.warming import warm_keys
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cacheforge.client import Cache
@@ -9,6 +11,7 @@ from cacheforge.coordination.singleflight import SingleFlight
 from cacheforge.exceptions import CacheUnavailable
 from cacheforge.observability import metrics
 
+from .models import Product
 from .repositories import ProductRepository
 from .schemas import ProductRead
 
@@ -40,9 +43,6 @@ class ProductService:
             # Redis is unreachable or timed out. Coalesce the fallback so a
             # burst of N failing cache reads does not become N DB queries.
             # Spec §8.1: "Fail-open does not mean unlimited database traffic."
-            # Phase 5 will still add a circuit breaker and bounded DB
-            # concurrency; this is the minimum needed to keep the fallback
-            # from amplifying a cache outage into a database outage.
             metrics.CACHE_FALLBACK.labels("redis_unavailable").inc()
             payload = await self._fallback_sf.do(
                 f"fallback:{key}",
@@ -79,3 +79,42 @@ class ProductService:
         # stays stale until TTL. Phase 6 outbox removes this window.
         with contextlib.suppress(CacheUnavailable):
             await self._cache.delete(self._detail_key(product_id))
+
+    async def warm_products(
+        self,
+        *,
+        limit: int = 100,
+        concurrency: int = 10,
+        batch_size: int = 50,
+    ) -> dict:
+        """Warm the detail cache for the first `limit` products by ID.
+
+        Spec §7.3: start with a fixed, explicit set. Phase 7 may add a
+        popularity table; for now, "first N by ID" is deterministic and
+        sufficient to demonstrate cold-vs-warm behavior.
+        """
+        async with self._sessionmaker() as session:
+            result = await session.execute(select(Product.id).order_by(Product.id).limit(limit))
+            product_ids = [row[0] for row in result]
+
+        key_to_id = {self._detail_key(pid): pid for pid in product_ids}
+        keys = list(key_to_id)
+
+        async def loader(key: str) -> dict | None:
+            return await self._load_detail(key_to_id[key])
+
+        warming = await warm_keys(
+            cache=self._cache,
+            keys=keys,
+            loader=loader,
+            concurrency=concurrency,
+            batch_size=batch_size,
+        )
+        return {
+            "total": warming.total,
+            "succeeded": warming.succeeded,
+            "failed": warming.failed,
+            "skipped": warming.skipped,
+            "duration_seconds": round(warming.duration_seconds, 3),
+            "success_rate": round(warming.success_rate, 4),
+        }

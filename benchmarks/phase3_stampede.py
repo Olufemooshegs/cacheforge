@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -146,6 +147,57 @@ async def wait_for_api(timeout: float = 20.0) -> None:
     raise RuntimeError(f"API did not become ready in {timeout}s: {last_err}")
 
 
+def assert_port_free(port: int) -> None:
+    """Fail loudly if a ghost uvicorn is already bound."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", port))
+    except OSError as exc:
+        raise RuntimeError(
+            f"port {port} is already in use: {exc}\n"
+            f"Kill the ghost: pkill -9 -f 'uvicorn'; "
+            f"ss -ltnp 'sport = :{port}'"
+        ) from exc
+    finally:
+        s.close()
+
+
+def wait_for_port_free(port: int, timeout: float = 10.0) -> None:
+    """Block until the port is genuinely free (uvicorn fully shut down)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            s.close()
+            return
+        except OSError:
+            s.close()
+            time.sleep(0.1)
+    raise RuntimeError(f"port {port} did not become free within {timeout}s")
+
+
+async def assert_routes_present(required: set[str]) -> None:
+    """Confirm the running server actually exposes the routes we need.
+
+    If a stale uvicorn is answering /health, this catches it before we
+    misinterpret an old-code measurement as a new-code one.
+    """
+    async with httpx.AsyncClient(base_url=API_URL, timeout=5.0) as client:
+        resp = await client.get("/openapi.json")
+        resp.raise_for_status()
+        paths = set(resp.json().get("paths", {}).keys())
+    missing = required - paths
+    if missing:
+        raise RuntimeError(
+            f"running server is missing routes: {sorted(missing)}\n"
+            f"paths present: {sorted(paths)}\n"
+            f"This means a stale uvicorn is bound to {API_PORT}."
+        )
+
+
 def start_uvicorn(workers: int) -> subprocess.Popen[bytes]:
     # Intentionally not context-managed: this fd becomes the child's stdout
     # and must live for the child's entire lifetime.
@@ -174,6 +226,8 @@ def start_uvicorn(workers: int) -> subprocess.Popen[bytes]:
 
 def stop_uvicorn(proc: subprocess.Popen[bytes]) -> None:
     if proc.poll() is not None:
+        with contextlib.suppress(RuntimeError):
+            wait_for_port_free(API_PORT, timeout=2.0)
         return
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -184,6 +238,9 @@ def stop_uvicorn(proc: subprocess.Popen[bytes]) -> None:
     except subprocess.TimeoutExpired:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+    wait_for_port_free(API_PORT, timeout=10.0)
 
 
 def assert_alive(proc: subprocess.Popen[bytes]) -> None:
@@ -300,10 +357,12 @@ async def run_for_workers(
     pg: asyncpg.Connection,
 ) -> Result:
     print(f"\n=== workers={workers} ===")
+    assert_port_free(API_PORT)
     proc = start_uvicorn(workers)
     try:
         await wait_for_api()
         assert_alive(proc)
+        await assert_routes_present({"/health", "/products/{product_id}"})
         print(f"  uvicorn ready on {API_URL}")
         result = await measure_burst(r, pg, workers, n_requests)
         print(
@@ -346,7 +405,7 @@ def print_verdict(results: list[Result]) -> None:
             "burst after DEL of the cache key. Either the key wasn't "
             "actually deleted, the app has cache_bypass enabled, or the "
             "GET did not reach Postgres. Check: "
-            "curl -sL http://127.0.0.1:8765/metrics/ | grep cache_load"
+            f"curl -sL http://127.0.0.1:{API_PORT}/metrics/ | grep cache_load"
         )
         return
 
@@ -384,10 +443,12 @@ async def async_main(n_requests: int) -> int:
     pg = await asyncpg.connect(PG_URL)
     try:
         print("=== Sanity check ===")
+        assert_port_free(API_PORT)
         proc = start_uvicorn(1)
         try:
             await wait_for_api()
             assert_alive(proc)
+            await assert_routes_present({"/health", "/products/{product_id}"})
             await sanity_check(r, pg)
         finally:
             stop_uvicorn(proc)
