@@ -1,207 +1,134 @@
-# CacheForge
+# CacheForge: Distributed Cache Layer
 
-A reusable, Redis-backed distributed cache layer for Python applications, built to demonstrate *measurable* cache engineering: cache-aside, single-flight, cache warming, circuit breaking, consistency trade-offs, and reproducible benchmarks.
+[![CI](https://github.com/Olufemooshegs/cacheforge/actions/workflows/ci.yml/badge.svg)](https://github.com/Olufemooshegs/cacheforge/actions/workflows/ci.yml)
 
-> **PostgreSQL is truth. Redis is a performance layer.**
-> Every cache behavior — hits, misses, invalidation failures, stale windows, outages — is explicit and tested.
+A production-oriented, Redis-backed distributed caching layer for Python. CacheForge sits between FastAPI and PostgreSQL to reduce database load, lower latency, and survive cache outages without taking down the database.
 
----
+**PostgreSQL is the source of truth. Redis is a performance layer.**
 
-## Why this exists
+## 📊 Results (Real Benchmarks)
 
-Most "we added Redis" projects measure one number: `GET /thing` got faster. That's not enough. Cache engineering is about answering:
+Using `k6` to simulate 50 concurrent users for 30 seconds, CacheForge demonstrates its impact under sustained load:
 
-- **When caching helps** — and when it doesn't
-- **How stale the data can get** under failure
-- **What happens when the cache dies** — does the DB absorb the shock, or die with it?
-- **How concurrent misses coalesce** — or don't
-- **How warmed-cache performance compares to cold** under a controlled workload
+| Scenario | Throughput | Avg Latency | p95 Latency | DB Queries |
+|---|---|---|---|---|
+| **Baseline** (No Cache) | 258 req/s | 193 ms | 408 ms | ~7,700 |
+| **CacheForge** (Hot Keys) | **798 req/s** | **62 ms** | **94 ms** | **~0** |
 
-CacheForge measures each of these. It also names what it *doesn't* solve.
+- **3.1× increase** in throughput.
+- **4.3× improvement** in p95 tail latency.
+- **Zero** database queries during the cached run.
 
----
-
-## Feature highlights
-
-- **Cache-aside reads** with deterministic keys, namespacing, versioning, and TTL jitter
-- **Explicit invalidation** after DB commits (write-through is *not* silent — see `CONSISTENCY.md`)
-- **Per-process single-flight** to coalesce concurrent cold misses
-- **Bounded Redis-failure fallback** — 500 concurrent outages → **1 DB query**, not 500
-- **Circuit breaker** with `CLOSED` / `OPEN` / `HALF_OPEN` states and a sliding-window failure detector
-- **Bounded cache warming** worker with retries, batching, and concurrency limits
-- **Prometheus metrics** with bounded cardinality
-- **Reproducible benchmarks** for cold-vs-warm, stampede protection, and breaker impact
-- **Failure-injection tests** for Redis outage, invalidation failure, and stale-read races
+*See [benchmarks/README.md](benchmarks/README.md) for full methodology, WSL2 caveats, and failure-injection results.*
 
 ---
 
-## Architecture
+## ✨ Features
 
+- **Cache-Aside Reads**: Deterministic keys, namespacing, versioning, and configurable TTL with jitter.
+- **Single-Flight Coalescing**: Protects the database from stampedes during cold starts.
+- **Circuit Breaker**: Automatically short-circuits Redis calls after repeated failures.
+- **Bounded Fallback**: If Redis dies, concurrent requests coalesce into *one* DB query, not thousands.
+- **Transactional Outbox**: Guarantees cache invalidation even if Redis is down when a DB write commits.
+- **Observability**: Built-in Prometheus metrics and provisioned Grafana dashboards.
+- **Cache Warming**: Bounded, retried background worker to pre-populate hot data.
+
+---
+
+## 🏗️ Architecture
+
+```mermaid
+graph TD
+    Client[Client / k6] -->|HTTP| API[FastAPI Demo]
+    
+    subgraph CacheForge
+        API --> Cache[Cache Layer]
+        Cache --> SF[SingleFlight]
+        Cache --> CB[Circuit Breaker]
+        Cache --> Metrics[Prometheus Metrics]
+    end
+    
+    Cache -->|Read/Write| Redis[(Redis)]
+    Cache -->|Fallback / Miss| DB[(PostgreSQL)]
+    
+    Outbox[Outbox Worker] -->|Polls| DB
+    Outbox -->|Invalidates| Redis
+    
+    Prometheus -->|Scrapes| Metrics
+    Grafana -->|Visualizes| Prometheus
 ```
-Client (k6 / curl)
-     │
-     ▼
-FastAPI demo (demo/api.py)
-     │
-     ▼
-CacheForge (src/cacheforge/)
-  - Cache (get / set / delete / get_or_load)
-  - KeyBuilder (namespace + version + parts)
-  - SingleFlight (per-process coalescing)
-  - CircuitBreaker (CLOSED / OPEN / HALF_OPEN)
-  - JsonSerializer
-  - WarmingWorker (bounded, retried)
-     │
-     ├── Redis (TTL, cache storage)
-     │
-     └── PostgreSQL (source of truth)
-```
+
+### Request Flow (Cache Miss)
+1. App requests data from Cache.
+2. Cache misses in Redis.
+3. `SingleFlight` locks the key. One request queries Postgres.
+4. Data is written to Redis.
+5. All waiting requests receive the result.
 
 ---
 
-## Quick start
+## 🚀 Quick Start
 
-docker compose up -d                # Redis on 6380, Postgres on 5433
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-
-alembic upgrade head                # schema is managed by Alembic
-python -m demo.seed                 # 1000 deterministic products
-python -m uvicorn demo.api:app --port 8000
+Requires Docker and Python 3.12+.
 
 ```bash
-git clone https://github.com/<you>/cacheforge
+# 1. Clone and configure
+git clone https://github.com/Olufemooshegs/cacheforge.git
 cd cacheforge
-
 cp .env.example .env
 
-docker compose up -d                # Redis on 6380, Postgres on 5433
-python3.12 -m venv .venv && source .venv/bin/activate
+# 2. Start infrastructure (Redis, Postgres, Prometheus, Grafana)
+docker compose up -d
+
+# 3. Set up Python environment
+python3.12 -m venv .venv
+source .venv/bin/activate
 pip install -e ".[dev]"
 
-python -m demo.seed                 # 1000 deterministic products
-python -m uvicorn demo.api:app --port 8000
+# 4. Run database migrations and seed data
+alembic upgrade head
+python -m demo.seed
 
-# in another terminal:
-curl -s localhost:8000/products/1 | jq
-curl -s localhost:8000/products/1 | jq     # second call = cache hit
-curl -sL localhost:8000/metrics/ | grep cache_requests_total
+# 5. Start the API
+python -m uvicorn demo.api:app --host 0.0.0.0 --port 8000
 ```
 
-### Verify the whole stack
-
+### Verify the Stack
 ```bash
-python -m pytest -q            # 59 passed
-ruff check . && ruff format --check .
+# Terminal 2: Run the test suite
+python -m pytest -q
+
+# Hit the API
+curl -s localhost:8000/products/1 | jq
+
+# View the Grafana Dashboard
+open http://localhost:3000
+# View Prometheus Metrics
+open http://localhost:9090
 ```
 
 ---
 
-## Environment variables
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `CACHEFORGE_DATABASE_URL` | `postgresql+asyncpg://cacheforge:cacheforge@localhost:5433/cacheforge` | Postgres |
-| `CACHEFORGE_REDIS_URL` | `redis://localhost:6380/0` | Redis |
-| `CACHEFORGE_CACHE_DEFAULT_TTL_SECONDS` | `300` | Default cache TTL |
-| `CACHEFORGE_CACHE_NAMESPACE` | `cacheforge` | Key prefix |
-| `CACHEFORGE_CACHE_VERSION` | `v1` | Key schema version |
-| `CACHEFORGE_CACHE_BYPASS` | `false` | If true, cache is disabled (benchmarking only) |
-| `CACHEFORGE_CIRCUIT_FAILURE_THRESHOLD` | `5` | Failures before breaker opens |
-| `CACHEFORGE_CIRCUIT_WINDOW_SIZE` | `20` | Sliding window size |
-| `CACHEFORGE_CIRCUIT_RECOVERY_TIMEOUT_SECONDS` | `5.0` | Wait before half-open probe |
-
----
-
-## API endpoints
+## 🛠️ API Endpoints
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/health` | Liveness |
-| `GET` | `/health/ready` | Readiness (Redis + Postgres ping) |
-| `GET` | `/products/{id}` | Cache-aside read |
-| `PATCH` | `/products/{id}` | Update + invalidate |
-| `DELETE` | `/products/{id}` | Delete + invalidate |
-| `POST` | `/admin/cache/invalidate/{id}` | Manual invalidation |
-| `POST` | `/admin/cache/warm?limit=N` | Warm the first N products |
-| `GET` | `/admin/cache/circuit-state` | Current breaker state |
-| `GET` | `/metrics/` | Prometheus metrics |
-
-> **Note:** Admin endpoints are unprotected in this demo. Any non-local deployment must add auth (see spec §16).
+| `GET` | `/products/{id}` | Fetch product (cache-aside) |
+| `PATCH` | `/products/{id}` | Update + invalidate cache |
+| `DELETE` | `/products/{id}` | Delete + invalidate cache |
+| `POST` | `/admin/cache/warm` | Warm cache for top N products |
+| `GET` | `/admin/cache/circuit-state` | Check breaker state |
+| `GET` | `/admin/outbox/stats` | Check pending outbox events |
 
 ---
 
-## Consistency model
+## 🧠 Design Decisions & Trade-offs
 
-See **[CONSISTENCY.md](CONSISTENCY.md)** for the full model. Summary:
-
-- PostgreSQL is the source of truth. Every write commits to Postgres first, then invalidates Redis.
-- Under **invalidation failure** (Window 1), stale data serves until TTL expires (default 300s).
-- Under **read/write races** (Window 2), a slow reader can repopulate the cache with a pre-write value; stale until TTL.
-- **No distributed lock.** Phase 3 measured this trade-off explicitly: cross-process duplication is bounded by worker count, so the lock overhead is not justified.
-- **TTL is the safety net** — invalidation is not guaranteed.
+- **Eventual Consistency over Strong Consistency**: We use a transactional outbox and best-effort invalidation. There is a sub-second window where stale data can be served after a write. See [CONSISTENCY.md](CONSISTENCY.md) for the exact guarantees.
+- **No Distributed Locks by Default**: Benchmarks proved per-process single-flight is sufficient. A distributed lock adds latency without meaningful DB savings. See [benchmarks/README.md](benchmarks/README.md).
+- **Fail-Open, but Bounded**: If Redis dies, the app falls back to Postgres. However, we use a second `SingleFlight` for the fallback to prevent the cache outage from becoming a database outage.
 
 ---
 
-## Resilience
-
-- **Per-op timeouts** on all Redis calls (default 500ms)
-- **Single-flight fallback** — a burst of `CacheUnavailable` coalesces to one DB query
-- **Circuit breaker** — after N failures in the sliding window, all Redis ops short-circuit for `recovery_timeout`, then probe half-open
-- **Bounded warming** — batched concurrency, capped retries, per-key backoff
-
-The breaker exists because *fail-open does not mean unlimited database traffic* (spec §8.1).
-
----
-
-## Benchmarks
-
-See **[benchmarks/README.md](benchmarks/README.md)** for full results, methodology, and environment. Highlights:
-
-| Phase | What | Result |
-|---|---|---|
-| Phase 3 | Cross-process stampede | `pg_delta=2` for 500 concurrent requests across 2 workers → distributed lock **not** justified |
-| Phase 4 | Cold vs warm cache | 100/100 hits when warm, **2.69× speedup**, 0 read-path DB queries |
-| Phase 5a | Circuit breaker impact | `pg_delta` unchanged, `loader_delta` → 0 (fallback served the burst), elapsed unchanged on WSL2 |
-
-Every run is reproducible with `python -m benchmarks.<phase>`. Every claim in this README has a corresponding measurement.
-
----
-
-## Known limitations
-
-1. **WSL2 networking dominates concurrent-burst latency.** 500-connection bursts take ~7s regardless of cache behavior. Phase 7 moves the load generator into the Docker network.
-2. **Postgres stats undercount on WSL2.** Cold-path `pg_delta` is a lower bound; warm-path `pg_delta` requires a canary-settle (implemented). Not a measurement bug — an environment constraint, documented.
-3. **List/query caches are not cached.** Only detail views. Rationale and future strategy in `CONSISTENCY.md`.
-4. **Negative caching is not enabled.** Missing-product lookups hit the DB every time.
-5. **Transactional outbox is not yet implemented** (Phase 6). Invalidation failure currently means stale-until-TTL.
-6. **Admin endpoints are unauthenticated.** Local demo only.
-7. **No Grafana dashboard yet** (Phase 7).
-
----
-
-## Roadmap
-
-- [x] **Phase 1** — vertical slice: cache-aside, invalidation, metrics
-- [x] **Phase 1.1** — real-Redis integration tests
-- [x] **Phase 2** — race tests + `CONSISTENCY.md` + invalidation-failure test
-- [x] **Phase 3** — stampede measurement (no lock needed) + bounded fallback
-- [x] **Phase 4** — cache warming worker + cold/warm benchmark
-- [x] **Phase 5a** — circuit breaker wired into `Cache`
-- [x] **Phase 5b** — container-level outage/recovery test
-- [x] **Phase 5c** — Postgres slowdown + retry-storm tests
-- [x] **Phase 6** — transactional outbox for reliable invalidation
-- [x] **Phase 7** — k6 load tests, Grafana dashboard, throughput experiments
-- [ ] **Phase 8** — CI, Dockerfile, release quality
-
----
-
-## Stack
-
-Python 3.12+ · FastAPI · Redis 7 · PostgreSQL 16 · SQLAlchemy 2 · asyncpg · Pydantic · prometheus-client · pytest · httpx · Docker Compose · ruff
-
----
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+## 📝 License
+MIT
