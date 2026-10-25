@@ -11,4 +11,5 @@ __pycache__/
 .coverage
 htmlcov/
 dist/
-build/
+build/benchmarks/k6/k6
+benchmarks/k6/results/

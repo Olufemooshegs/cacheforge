@@ -380,3 +380,35 @@ For every benchmark run reported above:
 What is **not** recorded: absolute timing to sub-millisecond precision.
 These are directional measurements. Phase 7 will add structured
 comparisons across hardware configurations.
+
+## Phase 7a — k6 Sustained Load (Baseline vs. Cached)
+
+### What we measure
+
+Sustained concurrency through steady Virtual Users (VUs), measuring
+end-to-end HTTP throughput. This captures the system's behavior under
+continuous load, rather than a single concurrent burst. 
+
+The workload uses three profiles:
+- **baseline**: Cache bypassed (`CACHEFORGE_CACHE_BYPASS=true`). Every read hits Postgres.
+- **hot**: 100% hit rate, uniform distribution over 5 keys.
+- **zipf / warm**: Skewed distribution over 1000 products. Warm pre-loads 100.
+
+### Results (2026-10-25, 50 VUs, 30s duration)
+
+| Scenario | Throughput | Avg Latency | p95 Latency | Errors |
+|---|---|---|---|---|
+| **Baseline** (bypass) | 258 req/s | 193 ms | 408 ms | 0% |
+| **Cold** (zipf, populates) | 714 req/s | 70 ms | 115 ms | 0% |
+| **Warm** (zipf, pre-warmed) | 794 req/s | 63 ms | 97 ms | 0% |
+| **Hot** (5 keys, uniform) | 798 req/s | 62 ms | 94 ms | 0% |
+
+### Verdict
+
+**ACCEPT.** Under sustained load, the cache provides a **3.1× throughput increase** and a **4.3× improvement in p95 latency** over the uncached baseline. 
+
+Interestingly, the Zipfian "cold" workload quickly becomes self-warming; its throughput (714 req/s) nearly matches the explicitly "warm" run (794 req/s) after just 30 seconds. This mirrors real-world access patterns, where popular items dominate.
+
+### Reproducibility
+
+Run `./benchmarks/k6/run.sh <mode>` for any mode. Ensure the API is running on `:8000` and k6 is installed. The baseline requires restarting uvicorn with `CACHEFORGE_CACHE_BYPASS=true`.
