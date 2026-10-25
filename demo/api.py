@@ -11,6 +11,7 @@ from sqlalchemy import text
 from cacheforge.client import Cache
 from cacheforge.config import CacheConfig
 from cacheforge.coordination.singleflight import SingleFlight
+from cacheforge.resilience import CircuitBreaker
 
 from .config import DemoSettings
 from .db import make_engine, make_sessionmaker
@@ -25,6 +26,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = make_engine(settings.database_url)
     sessionmaker = make_sessionmaker(engine)
     redis = Redis.from_url(settings.redis_url, decode_responses=False)
+    breaker = CircuitBreaker(
+        name="redis",
+        failure_threshold=settings.circuit_failure_threshold,
+        window_size=settings.circuit_window_size,
+        recovery_timeout=settings.circuit_recovery_timeout_seconds,
+    )
     cache = Cache(
         redis=redis,
         config=CacheConfig(
@@ -34,10 +41,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             cache_bypass=settings.cache_bypass,
         ),
         single_flight=SingleFlight(),
+        circuit_breaker=breaker,
     )
     app.state.engine = engine
     app.state.sessionmaker = sessionmaker
     app.state.redis = redis
+    app.state.breaker = breaker
     app.state.cache = cache
     app.state.service = ProductService(sessionmaker, cache)
     try:
@@ -117,3 +126,8 @@ async def warm_cache(
     return await request.app.state.service.warm_products(
         limit=limit, concurrency=concurrency, batch_size=batch_size
     )
+
+
+@app.get("/admin/cache/circuit-state")
+async def circuit_state(request: Request) -> dict[str, str]:
+    return {"state": request.app.state.breaker.state.value}
