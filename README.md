@@ -188,10 +188,10 @@ Every run is reproducible with `python -m benchmarks.<phase>`. Every claim in th
 - [x] **Phase 3** — stampede measurement (no lock needed) + bounded fallback
 - [x] **Phase 4** — cache warming worker + cold/warm benchmark
 - [x] **Phase 5a** — circuit breaker wired into `Cache`
-- [ ] **Phase 5b** — container-level outage/recovery test
-- [ ] **Phase 5c** — Postgres slowdown + retry-storm tests
-- [ ] **Phase 6** — transactional outbox for reliable invalidation
-- [ ] **Phase 7** — k6 load tests, Grafana dashboard, throughput experiments
+- [x] **Phase 5b** — container-level outage/recovery test
+- [x] **Phase 5c** — Postgres slowdown + retry-storm tests
+- [x] **Phase 6** — transactional outbox for reliable invalidation
+- [x] **Phase 7** — k6 load tests, Grafana dashboard, throughput experiments
 - [ ] **Phase 8** — CI, Dockerfile, release quality
 
 ---
