@@ -34,7 +34,11 @@ packages = ["src/cacheforge", "demo"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-markers = ["integration: requires running Redis + Postgres"]
+markers = [
+    "integration: requires running Redis + Postgres (auto-skipped if not up)",
+    "concurrency: concurrency and race-condition tests",
+    "failure_injection: deliberately injects failures to test resilience",
+]
 
 [tool.ruff]
 line-length = 100

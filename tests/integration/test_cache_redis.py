@@ -1,16 +1,11 @@
 """Integration tests against real Redis.
 
-Requires the compose stack: `docker compose up -d` (Redis on 6380).
-
-Run all:    pytest tests/integration -v
-Skip:       pytest -m "not integration"
-Auto-skip:  tests skip cleanly if Redis isn't reachable.
+Fixtures (real_redis, cache) live in tests/conftest.py.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import uuid
 
 import pytest
@@ -20,37 +15,6 @@ from cacheforge.client import MISS, Cache
 from cacheforge.config import CacheConfig
 
 pytestmark = pytest.mark.integration
-
-REDIS_URL = os.environ.get("CACHEFORGE_REDIS_URL", "redis://localhost:6380/0")
-
-
-@pytest.fixture
-async def real_redis():
-    client = Redis.from_url(REDIS_URL, socket_connect_timeout=0.5)
-    try:
-        await client.ping()
-    except Exception as exc:
-        await client.aclose()
-        pytest.skip(f"Redis not available at {REDIS_URL}: {exc}")
-    try:
-        yield client
-    finally:
-        await client.aclose()
-
-
-@pytest.fixture
-async def cache(real_redis: Redis):
-    ns = f"itest-{uuid.uuid4().hex[:8]}"
-    c = Cache(
-        real_redis,
-        CacheConfig(namespace=ns, version="v1", default_ttl_seconds=60),
-    )
-    try:
-        yield c
-    finally:
-        keys = [k async for k in real_redis.scan_iter(match=f"{ns}:*")]
-        if keys:
-            await real_redis.delete(*keys)
 
 
 async def test_set_get_roundtrip_against_real_redis(cache: Cache) -> None:
